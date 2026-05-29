@@ -1,4 +1,5 @@
 upstream-fixes/missing-dependencies.patch
+upstream-fixes/vertical-tab-black-flash.patch
 
 inox-patchset/fix-building-without-safebrowsing.patch
 inox-patchset/disable-autofill-download-manager.patch
@@ -188,6 +189,7 @@ helium/core/hibernate-tab-context-menu.patch
 helium/core/disable-side-panel-flyover.patch
 helium/core/custom-profile-avatar.patch
 helium/core/close-tabs-to-left.patch
+helium/core/custom-keyboard-shortcuts.patch
 
 helium/settings/settings-page-icons.patch
 helium/settings/move-search-suggest.patch
@@ -209,6 +211,8 @@ helium/settings/enable-quad9-doh-option.patch
 helium/settings/reorder-settings-menu.patch
 helium/settings/add-search-engine-button.patch
 helium/settings/custom-profile-avatar-ui.patch
+helium/settings/custom-keyboard-shortcuts-page.patch
+helium/settings/clear-browsing-data-popup.patch
 
 helium/hop/setup.patch
 helium/hop/disable-password-manager.patch
@@ -224,6 +228,7 @@ helium/ui/location-bar-page-action.patch
 helium/ui/tabs.patch
 helium/ui/tab-strip-controls.patch
 helium/ui/toolbar.patch
+helium/ui/remove-toolbar-dividers.patch
 helium/ui/toolbar-window-frame-hit-test.patch
 helium/ui/toolbar-button-prefs.patch
 helium/ui/omnibox.patch
@@ -252,7 +257,7 @@ helium/ui/side-panel-webui-customize.patch
 helium/ui/helium-logo-icons.patch
 helium/ui/square-ntp-monograms.patch
 helium/ui/default-theme.patch
-helium/ui/improve-toast.patch
+helium/ui/toast.patch
 helium/ui/square-interstitial-buttons.patch
 helium/ui/center-window-on-launch.patch
 helium/ui/remove-devtools-annoyances.patch
@@ -277,6 +282,7 @@ helium/ui/remove-autofill-link-to-password-manager.patch
 helium/ui/fix-caption-button-bounds.patch
 helium/ui/find-bar.patch
 helium/ui/remove-zoom-action.patch
+helium/ui/custom-keyboard-shortcuts-wiring.patch
 
 helium/ui/layout/migrate-prefs.patch
 helium/ui/layout/core.patch
@@ -293,6 +299,7 @@ helium/ui/layout/compact.patch
 helium/ui/layout/vertical.patch
 helium/ui/layout/toolbar-actions.patch
 
+helium/ui/generate-standard-qr-codes.patch
 helium/ui/pdf-viewer.patch
 helium/ui/hide-pip-live-caption-button.patch
 helium/ui/disable-ink-ripple-effect.patch
