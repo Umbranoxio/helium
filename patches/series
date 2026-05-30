@@ -313,3 +313,4 @@ helium/ui/experiments/anchor-tabs/anchored-tabs-rename-restore.patch
 helium/ui/experiments/anchor-tabs/anchored-tabs-startup-setting.patch
 helium/ui/experiments/anchor-tabs/anchored-tabs-group-hibernation.patch
 helium/ui/experiments/anchor-tabs/anchored-tabs-standalone-and-rename.patch
+helium/ui/experiments/anchor-tabs/anchored-tabs-collapse-mru-and-close-fix.patch
