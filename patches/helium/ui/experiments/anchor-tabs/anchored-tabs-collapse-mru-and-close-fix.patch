@@ -1,5 +1,5 @@
-Anchored tabs: most-recently-active visibility in collapsed groups, and a fix
-for closing the active tab.
+Anchored tabs: most-recently-active visibility in collapsed groups, a fix
+for closing the active tab, and forcing new tabs to the bottom section.
 
 - When a tab group is collapsed, keep visible the tabs that are among the
   browser-wide 5 most-recently-active tabs (by last-active time) instead of only
@@ -11,6 +11,9 @@ for closing the active tab.
   fallback. That ran inside the close reentrancy guard (crashing on AddTab) and
   caused new tabs to "reopen instead of close". Closing now follows the standard
   path and activates the adjacent tab.
+- Forces a brand-new tab (Cmd/Ctrl+T, the new-tab button, omnibox Alt+Enter) to
+  open ungrouped at the bottom of the strip (the lower, non-anchored section) so
+  it is never absorbed into the active tab's group.
 
 --- a/chrome/browser/ui/tabs/tab_strip_model.cc
 +++ b/chrome/browser/ui/tabs/tab_strip_model.cc
@@ -26,7 +29,55 @@ for closing the active tab.
  }  // namespace
  
  TabGroupModelFactory::TabGroupModelFactory() {
-@@ -3941,21 +3936,12 @@
+@@ -1897,19 +1892,36 @@
+     // For all other types, respect what was passed to us, normalizing -1s and
+     // values that are too large.
+     if (index < 0 || index > count()) {
+-      const bool new_tab_next_to_active =
+-          profile_->GetPrefs()->GetBoolean(prefs::kNewTabNextToActive);
+-      const auto opener_group = GetTabGroupForTab(active_index());
+-
+-      if (count() >= 1 && new_tab_next_to_active) {
+-        if (group_model_ && opener_group && !(add_types & ADD_ACTIVE)) {
+-          index = static_cast<int>(
+-              group_model_->GetTabGroup(*opener_group)->ListTabs().end());
++      // Helium: a brand-new tab (Cmd/Ctrl+T, the new-tab button, or omnibox
++      // Alt+Enter) must always open ungrouped at the very bottom of the strip,
++      // i.e. in the lower (non-anchored) section — it must never be absorbed
++      // into the active tab's group. Forcing the index to count() places it
++      // after every group so the contiguity logic below leaves it ungrouped.
++      // Restored/explicitly-placed tabs use ADD_FORCE_INDEX or carry an
++      // explicit group, so they are excluded here.
++      const bool helium_new_tab_to_bottom =
++          features::IsHeliumAnchoredTabsEnabled() && !group.has_value() &&
++          (add_types & ADD_FORCE_INDEX) == 0 &&
++          ui::PageTransitionTypeIncludingQualifiersIs(
++              transition, ui::PAGE_TRANSITION_TYPED);
++
++      if (helium_new_tab_to_bottom) {
++        index = count();
++      } else {
++        const bool new_tab_next_to_active =
++            profile_->GetPrefs()->GetBoolean(prefs::kNewTabNextToActive);
++        const auto opener_group = GetTabGroupForTab(active_index());
++
++        if (count() >= 1 && new_tab_next_to_active) {
++          if (group_model_ && opener_group && !(add_types & ADD_ACTIVE)) {
++            index = static_cast<int>(
++                group_model_->GetTabGroup(*opener_group)->ListTabs().end());
++          } else {
++            index = active_index() + 1;
++          }
+         } else {
+-          index = active_index() + 1;
++          index = count();
+         }
+-      } else {
+-        index = count();
+       }
+     }
+   }
+@@ -3941,21 +3953,12 @@
      return;
    }
  
