@@ -1,6 +1,19 @@
 --- a/chrome/app/settings_strings.grdp
 +++ b/chrome/app/settings_strings.grdp
-@@ -313,6 +313,18 @@
+@@ -189,6 +189,12 @@
+     <message name="IDS_SETTINGS_ACCESSIBILITY_TOAST_FREQUENCY_DESCRIPTION" desc="Subtitle for a setting that allows you to change the frequency of feedback messages.">
+       Shows a confirmation when you copy links, images, or videos
+     </message>
++    <message name="IDS_SETTINGS_ACCESSIBILITY_TOAST_TOGGLE_TITLE" desc="Title for a setting that allows you to toggle clipboard copy and new tab toast notifications.">
++      Background action confirmation toasts
++    </message>
++    <message name="IDS_SETTINGS_ACCESSIBILITY_TOAST_TOGGLE_DESCRIPTION" desc="Subtitle for a setting that allows you to toggle clipboard copy and new tab toast notifications.">
++      Shows a toast notification when you copy content, such as links and images, or open a new background tab in Zen mode
++    </message>
+   </if>
+   <if expr="is_macosx">
+     <message name="IDS_SETTINGS_ACCESSIBILITY_COPY_PAGE_URL_SHORTCUT" desc="Toggle in settings that allows you to enable the keyboard shortcut that copies the current page URL to the clipboard. It's enabled by default.">
+@@ -313,6 +319,18 @@
    <message name="IDS_SETTINGS_MINIMAL_LOCATION_BAR" desc="Label for the toggle that enables the minimal address bar.">
      Minimal address bar
    </message>
@@ -21,7 +34,19 @@
    </message>
 --- a/chrome/browser/ui/webui/settings/settings_localized_strings_provider.cc
 +++ b/chrome/browser/ui/webui/settings/settings_localized_strings_provider.cc
-@@ -524,6 +524,10 @@ void AddAppearanceStrings(content::WebUI
+@@ -278,9 +278,9 @@ void AddA11yStrings(content::WebUIDataSo
+       {"focusHighlightLabel",
+        IDS_SETTINGS_ACCESSIBILITY_FOCUS_HIGHLIGHT_DESCRIPTION},
+       {"toastAlertLevelTitle",
+-       IDS_SETTINGS_ACCESSIBILITY_TOAST_FREQUENCY_TITLE},
++       IDS_SETTINGS_ACCESSIBILITY_TOAST_TOGGLE_TITLE},
+       {"toastAlertLevelDescription",
+-       IDS_SETTINGS_ACCESSIBILITY_TOAST_FREQUENCY_DESCRIPTION},
++       IDS_SETTINGS_ACCESSIBILITY_TOAST_TOGGLE_DESCRIPTION},
+ #endif
+ #if BUILDFLAG(IS_WIN) || BUILDFLAG(IS_LINUX) || BUILDFLAG(IS_MAC)
+       {"overscrollHistoryNavigationTitle",
+@@ -525,6 +525,10 @@ void AddAppearanceStrings(content::WebUI
        {"browserLayoutCompact", IDS_SETTINGS_BROWSER_LAYOUT_COMPACT},
        {"browserLayoutVertical", IDS_SETTINGS_BROWSER_LAYOUT_VERTICAL},
        {"tabStripRightAlign", IDS_SETTINGS_TAB_STRIP_RIGHT_ALIGN},
@@ -32,7 +57,7 @@
        {"centeredLocationBar", IDS_SETTINGS_CENTERED_LOCATION_BAR},
        {"verticalCollapseShortcut", IDS_SETTINGS_VERTICAL_COLLAPSE_SHORTCUT},
        {"minimalLocationBar", IDS_SETTINGS_MINIMAL_LOCATION_BAR},
-@@ -596,6 +600,9 @@ void AddAppearanceStrings(content::WebUI
+@@ -597,6 +601,9 @@ void AddAppearanceStrings(content::WebUI
                            tabs::IsVerticalTabsFeatureEnabled());
    html_source->AddBoolean("showVerticalTabsExpandOnHoverEnabled",
                            tabs::IsVerticalTabsExpandOnHoverFeatureEnabled());
@@ -220,7 +245,7 @@
    HeliumLayoutType GetBrowserLayout() const;
 --- a/chrome/browser/ui/tabs/tab_strip_prefs.cc
 +++ b/chrome/browser/ui/tabs/tab_strip_prefs.cc
-@@ -48,6 +48,9 @@ void RegisterProfilePrefs(user_prefs::Pr
+@@ -50,6 +50,9 @@ void RegisterProfilePrefs(user_prefs::Pr
    registry->RegisterIntegerPref(prefs::kHeliumLayout,
                                  std::to_underlying(HeliumLayoutType::kClassic));
    registry->RegisterBooleanPref(prefs::kHeliumVerticalRightAligned, false);
@@ -303,7 +328,7 @@
      {ui::VKEY_R, ui::EF_PLATFORM_ACCELERATOR, IDC_RELOAD},
 --- a/chrome/browser/ui/browser_command_controller.cc
 +++ b/chrome/browser/ui/browser_command_controller.cc
-@@ -1840,6 +1840,8 @@ void BrowserCommandController::InitComma
+@@ -1847,6 +1847,8 @@ void BrowserCommandController::InitComma
    // These are always enabled; the menu determines their menu item visibility.
    command_updater_.UpdateCommandEnabled(IDC_UPGRADE_DIALOG, true);
    command_updater_.UpdateCommandEnabled(IDC_HELIUM_SERVICES_OPEN, true);
@@ -323,3 +348,48 @@
      {IDC_SHOW_BOOKMARK_BAR, ui::EF_COMMAND_DOWN | ui::EF_SHIFT_DOWN,
       ui::VKEY_B},
      {IDC_SHOW_BOOKMARK_MANAGER, ui::EF_COMMAND_DOWN | ui::EF_ALT_DOWN,
+--- a/chrome/app/generated_resources.grd
++++ b/chrome/app/generated_resources.grd
+@@ -19417,6 +19417,9 @@ Please help our engineers fix this probl
+       <message name="IDS_LINK_COPIED_TOAST_BODY" desc="Text on a toast notification that is shown when a link is successfully copied.">
+         Link copied
+       </message>
++      <message name="IDS_ZEN_MODE_NEW_TAB_CREATED_TOAST_BODY" desc="Text on a toast notification that is shown when a link opens a new tab while Zen Mode is enabled.">
++        New tab opened
++      </message>
+       <message name="IDS_IMAGE_COPIED_TOAST_BODY" desc="Text on a toast notification that is shown when an image is successfully copied.">
+         Image copied
+       </message>
+--- a/chrome/browser/ui/toasts/api/toast_id.cc
++++ b/chrome/browser/ui/toasts/api/toast_id.cc
+@@ -75,6 +75,8 @@ std::string_view GetToastName(ToastId to
+       return "MultistepFilterSuggestionRecent";
+     case ToastId::kSkillSavedWithoutInvokeButton:
+       return "SkillSavedWithoutInvokeButton";
++    case ToastId::kZenModeNewTabCreated:
++      return "ZenModeNewTabCreated";
+   }
+ 
+   NOTREACHED();
+--- a/chrome/browser/ui/toasts/api/toast_id.h
++++ b/chrome/browser/ui/toasts/api/toast_id.h
+@@ -54,7 +54,8 @@ enum class ToastId {
+   kMultistepFilterSuggestion = 31,
+   kMultistepFilterSuggestionRecent = 32,
+   kSkillSavedWithoutInvokeButton = 33,
+-  kMaxValue = kSkillSavedWithoutInvokeButton,
++  kZenModeNewTabCreated = 34,
++  kMaxValue = kZenModeNewTabCreated,
+ };
+ // LINT.ThenChange(/tools/metrics/histograms/metadata/toasts/enums.xml:ToastId)
+ 
+--- a/tools/metrics/histograms/metadata/toasts/enums.xml
++++ b/tools/metrics/histograms/metadata/toasts/enums.xml
+@@ -92,6 +92,7 @@ chromium-metrics-reviews@google.com.
+   <int value="31" label="Filter Suggestion"/>
+   <int value="32" label="Filter Suggestion Recent"/>
+   <int value="33" label="Saved Skill without Invoke Button"/>
++  <int value="34" label="New tab created in Zen mode"/>
+ </enum>
+ 
+ <!-- LINT.ThenChange(/chrome/browser/ui/toasts/api/toast_id.h:ToastId) -->

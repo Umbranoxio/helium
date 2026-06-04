@@ -1,0 +1,1282 @@
+Standalone anchored tabs, inline tab rename, divergence-only anchor indicator,
+and return-to-anchor on close.
+
+- Adds an explicit per-tab "anchored" flag to TabUIHelper (persisted across
+  sessions like the existing custom title / anchored URL) so a standalone
+  (ungrouped, unpinned) tab can be anchored on its own. helium::IsAnchoredTab
+  honours the flag; helium::IsAnchorEligibleForUiFeatures gates the per-tab UI
+  behaviors (rename / indicator / close) to standalone-anchored and grouped
+  tabs, excluding pinned tabs.
+- The vertical unpinned container lays groups and standalone anchored tabs out
+  in a single ordered region above the separator (natural/model order), so
+  standalone anchors interleave freely with groups. Dragging a tab across the
+  separator anchors/un-anchors it, with the rest of the strip reflowing live as
+  the dragged tab crosses the separator; the decision is applied only on a
+  completed drop (TabDragTarget's end-of-drag carries a `completed` flag).
+- Double-clicking an anchor-eligible tab opens an inline rename text field in
+  the tab row (Enter / Esc / blur; empty resets to the page title). The custom
+  name persists across restarts via the session extra-data path.
+- The "/" anchor indicator is shown only once a tab has navigated away from its
+  original anchored URL (a "return to anchor" hint) and refreshes immediately on
+  navigation. The anchor URL is also captured for grouped tabs, skipping
+  blank/NTP URLs so an empty new tab is never treated as anchored.
+- The close button (and middle-click) on an anchor-eligible tab that has
+  navigated away from its anchor first returns it to the anchor URL instead of
+  closing; closing again at the anchor closes normally. Blank/NTP anchors never
+  hijack the close.
+
+--- a/chrome/browser/ui/helium/anchored_tab_hibernation.cc
++++ b/chrome/browser/ui/helium/anchored_tab_hibernation.cc
+@@ -4,8 +4,12 @@
+ 
+ #include "chrome/browser/ui/helium/anchored_tab_hibernation.h"
+ 
++#include <algorithm>
+ #include <optional>
+ #include <utility>
++#include <vector>
++
++#include "base/time/time.h"
+ 
+ #include "base/byte_size.h"
+ #include "base/strings/utf_string_conversions.h"
+@@ -242,6 +246,9 @@
+         (*extra_data)[TabUIHelper::kAnchoredTitleSessionKey] =
+             base::UTF16ToUTF8(helper->anchored_title());
+       }
++      if (helper->anchored()) {
++        (*extra_data)[TabUIHelper::kAnchoredSessionKey] = "1";
++      }
+     }
+   }
+ 
+@@ -259,6 +266,7 @@
+ 
+   TabUIHelper::RestoreCustomTitleFromExtraData(web_contents, extra_data);
+   TabUIHelper::RestoreAnchoredURLFromExtraData(web_contents, extra_data);
++  TabUIHelper::RestoreAnchoredFromExtraData(web_contents, extra_data);
+ }
+ 
+ bool ShouldRestoreHibernated(
+@@ -272,10 +280,100 @@
+ }
+ 
+ bool IsAnchoredTab(const TabStripModel* model, int model_index) {
+-  return features::IsHeliumAnchoredTabsEnabled() && model &&
+-         model->ContainsIndex(model_index) &&
+-         (model->GetTabGroupForTab(model_index).has_value() ||
+-          model->IsTabPinned(model_index));
++  if (!features::IsHeliumAnchoredTabsEnabled() || !model ||
++      !model->ContainsIndex(model_index)) {
++    return false;
++  }
++  // A tab can be explicitly anchored on its own (standalone anchored tab),
++  // even when it is neither grouped nor pinned.
++  if (content::WebContents* const web_contents =
++          model->GetWebContentsAt(model_index)) {
++    if (tabs::TabInterface* const tab =
++            tabs::TabInterface::GetFromContents(web_contents)) {
++      if (const TabUIHelper* const helper = TabUIHelper::From(tab);
++          helper && helper->anchored()) {
++        return true;
++      }
++    }
++  }
++  return model->GetTabGroupForTab(model_index).has_value() ||
++         model->IsTabPinned(model_index);
++}
++
++bool IsAnchorEligibleForUiFeatures(const TabStripModel* model,
++                                   int model_index) {
++  if (!features::IsHeliumAnchoredTabsEnabled() || !model ||
++      !model->ContainsIndex(model_index) ||
++      model->IsTabPinned(model_index)) {
++    return false;
++  }
++  if (content::WebContents* const web_contents =
++          model->GetWebContentsAt(model_index)) {
++    if (tabs::TabInterface* const tab =
++            tabs::TabInterface::GetFromContents(web_contents)) {
++      if (const TabUIHelper* const helper = TabUIHelper::From(tab);
++          helper && helper->anchored()) {
++        return true;
++      }
++    }
++  }
++  return model->GetTabGroupForTab(model_index).has_value();
++}
++
++base::flat_set<const content::WebContents*> GetTopRecentlyActiveContents(
++    const TabStripModel* model,
++    size_t top_n) {
++  base::flat_set<const content::WebContents*> result;
++  if (!model || top_n == 0) {
++    return result;
++  }
++
++  std::vector<std::pair<base::TimeTicks, content::WebContents*>> entries;
++  entries.reserve(model->count());
++  for (int i = 0; i < model->count(); ++i) {
++    content::WebContents* const contents = model->GetWebContentsAt(i);
++    if (!contents) {
++      continue;
++    }
++    entries.emplace_back(contents->GetLastActiveTimeTicks(), contents);
++  }
++  std::stable_sort(
++      entries.begin(), entries.end(),
++      [](const auto& a, const auto& b) { return a.first > b.first; });
++
++  const size_t limit = std::min(top_n, entries.size());
++  for (size_t i = 0; i < limit; ++i) {
++    result.insert(entries[i].second);
++  }
++  return result;
++}
++
++bool HibernateGroupTabsOutsideTopRecent(TabStripModel* model,
++                                        tab_groups::TabGroupId group,
++                                        size_t top_n) {
++  if (!features::IsHeliumAnchoredTabsEnabled()) {
++    return false;
++  }
++  if (!model || !model->group_model()->ContainsTabGroup(group)) {
++    return false;
++  }
++
++  const base::flat_set<const content::WebContents*> top =
++      GetTopRecentlyActiveContents(model, top_n);
++
++  bool any_hibernated = false;
++  const gfx::Range tab_range =
++      model->group_model()->GetTabGroup(group)->ListTabs();
++  for (int model_index : tab_range.ToIntVector()) {
++    content::WebContents* const web_contents =
++        model->GetWebContentsAt(model_index);
++    if (!web_contents || web_contents->WasDiscarded() ||
++        model_index == model->active_index() || top.contains(web_contents)) {
++      continue;
++    }
++    any_hibernated |= HibernateWebContents(web_contents);
++  }
++  return any_hibernated;
+ }
+ 
+ bool IsLiveAnchoredTab(const TabStripModel* model, int model_index) {
+--- a/chrome/browser/ui/helium/anchored_tab_hibernation.h
++++ b/chrome/browser/ui/helium/anchored_tab_hibernation.h
+@@ -5,9 +5,11 @@
+ #ifndef CHROME_BROWSER_UI_HELIUM_ANCHORED_TAB_HIBERNATION_H_
+ #define CHROME_BROWSER_UI_HELIUM_ANCHORED_TAB_HIBERNATION_H_
+ 
++#include <cstddef>
+ #include <map>
+ #include <string>
+ 
++#include "base/containers/flat_set.h"
+ #include "components/tabs/public/tab_group.h"
+ 
+ class TabStripModel;
+@@ -31,6 +33,23 @@
+ bool ShouldRestoreHibernated(
+     const std::map<std::string, std::string>& extra_data);
+ bool IsAnchoredTab(const TabStripModel* model, int model_index);
++// Like IsAnchoredTab, but only for tabs that carry a per-tab title/URL and a
++// close button: standalone explicitly-anchored tabs and tabs inside a group.
++// Pinned tabs are excluded. Used to gate the inline-rename, return-to-anchor
++// indicator and close-to-anchor behaviors.
++bool IsAnchorEligibleForUiFeatures(const TabStripModel* model, int model_index);
++// Returns the set of web contents that are among the `top_n` most recently
++// active tabs across the whole `model` (by last-active time). Used to decide
++// which tabs of a collapsed group remain visible.
++base::flat_set<const content::WebContents*> GetTopRecentlyActiveContents(
++    const TabStripModel* model,
++    size_t top_n);
++// Discards (hibernates) the loaded, non-active tabs of `group` that are NOT
++// among the `top_n` most recently active tabs across `model`. Returns true if
++// any tab was discarded.
++bool HibernateGroupTabsOutsideTopRecent(TabStripModel* model,
++                                        tab_groups::TabGroupId group,
++                                        size_t top_n);
+ bool IsLiveAnchoredTab(const TabStripModel* model, int model_index);
+ bool MaybeHibernateAnchoredTab(TabStripModel* model, int model_index);
+ bool MaybeHibernateGroupedTab(TabStripModel* model, int model_index);
+--- a/chrome/browser/ui/tab_ui_helper.cc
++++ b/chrome/browser/ui/tab_ui_helper.cc
+@@ -530,6 +530,76 @@
+   }
+ }
+ 
++void TabUIHelper::SetAnchored(bool anchored, bool persist) {
++  if (!features::IsHeliumAnchoredTabsEnabled()) {
++    return;
++  }
++
++  // Avoid redundant UI churn when nothing changed, but still allow an explicit
++  // (persist) call to re-write the durable value.
++  if (anchored_ == anchored && !persist) {
++    return;
++  }
++  anchored_ = anchored;
++
++  // When a tab is first anchored, remember its current URL as the anchor so the
++  // "return to anchor" affordance can detect later navigations away from it.
++  if (anchored_ && !anchored_url_.is_valid() && web_contents()) {
++    GURL url = web_contents()->GetLastCommittedURL();
++    if (!url.is_valid()) {
++      url = web_contents()->GetVisibleURL();
++    }
++    if (url.is_valid()) {
++      SetAnchoredURL(url, web_contents()->GetTitle(), persist);
++    }
++  }
++
++  // Push the change through the existing tab-state-changed plumbing so the tab
++  // strip re-partitions the tab above/below the anchored separator.
++  if (web_contents()) {
++    web_contents()->NotifyNavigationStateChanged(content::INVALIDATE_TYPE_TAB);
++  }
++  tab_ui_change_callbacks_.Notify();
++
++  if (!persist || !web_contents()) {
++    return;
++  }
++
++  Profile* const profile =
++      Profile::FromBrowserContext(web_contents()->GetBrowserContext());
++  SessionService* const session_service =
++      profile ? SessionServiceFactory::GetForProfile(profile) : nullptr;
++  sessions::SessionTabHelper* const tab_helper =
++      sessions::SessionTabHelper::FromWebContents(web_contents());
++  if (!session_service || !tab_helper) {
++    return;
++  }
++
++  session_service->AddTabExtraData(tab_helper->window_id(),
++                                   tab_helper->session_id(), kAnchoredSessionKey,
++                                   anchored_ ? "1" : "0");
++}
++
++void TabUIHelper::RestoreAnchoredFromExtraData(
++    content::WebContents* web_contents,
++    const std::map<std::string, std::string>& extra_data) {
++  if (!features::IsHeliumAnchoredTabsEnabled() || !web_contents) {
++    return;
++  }
++
++  auto it = extra_data.find(kAnchoredSessionKey);
++  if (it == extra_data.end() || it->second != "1") {
++    return;
++  }
++
++  if (tabs::TabInterface* const tab_interface =
++          tabs::TabInterface::GetFromContents(web_contents)) {
++    if (TabUIHelper* const helper = TabUIHelper::From(tab_interface)) {
++      helper->SetAnchored(true, /*persist=*/false);
++    }
++  }
++}
++
+ void TabUIHelper::SetAnchoredURL(const GURL& url,
+                                  std::u16string title,
+                                  bool persist) {
+--- a/chrome/browser/ui/tab_ui_helper.h
++++ b/chrome/browser/ui/tab_ui_helper.h
+@@ -145,10 +145,19 @@
+       const std::map<std::string, std::string>& extra_data);
+   const GURL& anchored_url() const { return anchored_url_; }
+   const std::u16string& anchored_title() const { return anchored_title_; }
++  // Explicit per-tab anchored flag. Lets a standalone (ungrouped, unpinned) tab
++  // be anchored on its own. Restore paths pass `persist=false` while
++  // rehydrating.
++  void SetAnchored(bool anchored, bool persist = true);
++  static void RestoreAnchoredFromExtraData(
++      content::WebContents* web_contents,
++      const std::map<std::string, std::string>& extra_data);
++  bool anchored() const { return anchored_; }
+   static constexpr char kCustomTitleSessionKey[] = "helium.custom_title";
+   static constexpr char kHibernatedSessionKey[] = "helium.hibernated";
+   static constexpr char kAnchoredURLSessionKey[] = "helium.anchored_url";
+   static constexpr char kAnchoredTitleSessionKey[] = "helium.anchored_title";
++  static constexpr char kAnchoredSessionKey[] = "helium.anchored";
+ 
+   base::WeakPtr<TabUIHelper> GetWeakPtr();
+ 
+@@ -171,6 +180,7 @@
+   std::u16string custom_title_;
+   GURL anchored_url_;
+   std::u16string anchored_title_;
++  bool anchored_ = false;
+   GURL last_requested_favicon_page_url_;
+   bool favicon_fetch_in_flight_ = false;
+   base::CancelableTaskTracker favicon_task_tracker_;
+--- a/chrome/browser/ui/tabs/tab_menu_model.cc
++++ b/chrome/browser/ui/tabs/tab_menu_model.cc
+@@ -32,6 +32,7 @@
+ #include "chrome/browser/ui/tabs/split_tab_swap_menu_model.h"
+ #include "chrome/browser/ui/tabs/tab_group_model.h"
+ #include "chrome/browser/ui/tabs/tab_menu_model_delegate.h"
++#include "chrome/browser/ui/helium/anchored_tab_hibernation.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model_delegate.h"
+ #include "chrome/browser/ui/tabs/tab_utils.h"
+@@ -287,9 +288,8 @@
+   AddSeparator(ui::NORMAL_SEPARATOR);
+ 
+   const bool helium_is_single_anchored_tab =
+-      features::IsHeliumAnchoredTabsEnabled() && indices.size() == 1 &&
+-      (tab_strip->GetTabGroupForTab(indices.front()).has_value() ||
+-       tab_strip->IsTabPinned(indices.front()));
++      indices.size() == 1 &&
++      helium::IsAnchoredTab(tab_strip, indices.front());
+   if (helium_is_single_anchored_tab) {
+     AddItemWithStringId(TabStripModel::CommandRenameTab,
+                         IDS_TAB_CXMENU_RENAMETAB);
+--- a/chrome/browser/ui/views/frame/multi_contents_view_drop_target_controller_unittest.cc
++++ b/chrome/browser/ui/views/frame/multi_contents_view_drop_target_controller_unittest.cc
+@@ -357,7 +357,7 @@
+   EXPECT_TRUE(drop_target_view().GetVisible());
+ 
+   // Ending the drag should hide it.
+-  controller().OnTabDragEnded();
++  controller().OnTabDragEnded(/*completed=*/true);
+   FastForward(kHideDropTargetDelay + kHideDropTargetAnimation);
+   EXPECT_FALSE(drop_target_view().GetVisible());
+ }
+--- a/chrome/browser/ui/views/frame/multi_contents_view_drop_target_controller.cc
++++ b/chrome/browser/ui/views/frame/multi_contents_view_drop_target_controller.cc
+@@ -135,7 +135,7 @@
+   HideDropTarget();
+ }
+ 
+-void MultiContentsViewDropTargetController::OnTabDragEnded() {
++void MultiContentsViewDropTargetController::OnTabDragEnded(bool completed) {
+   ResetDropTargetTimers();
+   HideDropTarget();
+ }
+--- a/chrome/browser/ui/views/frame/multi_contents_view_drop_target_controller.h
++++ b/chrome/browser/ui/views/frame/multi_contents_view_drop_target_controller.h
+@@ -68,7 +68,7 @@
+                                    const gfx::Point& point_in_screen) override;
+   void OnTabDragEntered() override;
+   void OnTabDragExited(const gfx::Point& point_in_screen) override;
+-  void OnTabDragEnded() override;
++  void OnTabDragEnded(bool completed) override;
+   bool CanDropTab() override;
+   void HandleTabDrop(TabDragTarget::DragController& controller) override;
+   base::CallbackListSubscription RegisterWillDestroyCallback(
+--- a/chrome/browser/ui/views/tabs/dragging/tab_drag_controller_interactive_uitest.cc
++++ b/chrome/browser/ui/views/tabs/dragging/tab_drag_controller_interactive_uitest.cc
+@@ -189,7 +189,7 @@
+   void OnTabDragExited(const gfx::Point& point_in_screen) override {
+     drag_exited_ = true;
+   }
+-  void OnTabDragEnded() override { drag_ended_ = true; }
++  void OnTabDragEnded(bool completed) override { drag_ended_ = true; }
+   bool CanDropTab() override { return can_drop_; }
+   void HandleTabDrop(DragController& controller) override {
+     dropped_ = true;
+--- a/chrome/browser/ui/views/tabs/dragging/tab_drag_controller.cc
++++ b/chrome/browser/ui/views/tabs/dragging/tab_drag_controller.cc
+@@ -1872,7 +1872,9 @@
+   // Clear out drag data so we don't attempt to do anything with it.
+   drag_data_.tab_drag_data_.clear();
+   if (current_drag_target_) {
+-    current_drag_target_->OnTabDragEnded();
++    const bool drag_completed = previous_state != DragState::kNotStarted &&
++                                type == EndDragType::kNormal;
++    current_drag_target_->OnTabDragEnded(drag_completed);
+     ResetDragTarget();
+   }
+ 
+--- a/chrome/browser/ui/views/tabs/dragging/tab_drag_target.h
++++ b/chrome/browser/ui/views/tabs/dragging/tab_drag_target.h
+@@ -63,8 +63,9 @@
+   virtual void OnTabDragExited(const gfx::Point& point_in_screen) = 0;
+ 
+   // Notification for the end of a drag, for any reason (e.g. drop, cancel,
+-  // etc.).
+-  virtual void OnTabDragEnded() = 0;
++  // etc.). `completed` is true when the drag ended with a normal drop, and
++  // false when it was canceled or reverted (e.g. Esc, capture loss).
++  virtual void OnTabDragEnded(bool completed) = 0;
+ 
+   // Indicates whether this delegate should handle a dropped tab.
+   virtual bool CanDropTab() = 0;
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_dragged_tabs_container.cc
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_dragged_tabs_container.cc
+@@ -127,7 +127,10 @@
+   scroll_handler_.StopScrolling();
+ }
+ 
+-void VerticalDraggedTabsContainer::OnTabDragEnded() {
++void VerticalDraggedTabsContainer::OnTabDragEnded(bool completed) {
++  // Apply the anchored decision while the dragged views are still tracked. On a
++  // canceled/reverted drag (`completed` is false) the decision is discarded.
++  FinalizeDragAnchorState(completed);
+   ResetDragState();
+   scroll_handler_.StopScrolling();
+ }
+@@ -574,6 +577,10 @@
+   const views::ProposedLayout& drag_layout = GetLayoutForDrag();
+   const auto* target = GetTargetForTabDrag(drag_layout, dragged_tab_bounds);
+ 
++  // Let derived containers track whether the dragged tab is currently above or
++  // below the anchored separator.
++  UpdateDragAnchorState(dragged_tab_bounds, drag_layout);
++
+   // A null target implies the drag is at the end of the container. We
+   // intentionally invalidate layout here to support resizing the container as
+   // the drag exceeds its bounds.
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_dragged_tabs_container.h
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_dragged_tabs_container.h
+@@ -65,7 +65,7 @@
+                                    const gfx::Point& point_in_screen) override;
+   void OnTabDragEntered() final {}
+   void OnTabDragExited(const gfx::Point& point_in_screen) final;
+-  void OnTabDragEnded() final;
++  void OnTabDragEnded(bool completed) final;
+   bool CanDropTab() final;
+   void HandleTabDrop(TabDragTarget::DragController& controller) final {}
+   base::CallbackListSubscription RegisterWillDestroyCallback(
+@@ -121,6 +121,17 @@
+ 
+   tabs::VerticalTabStripCollapseState GetTabStripCollapseState() const;
+ 
++  std::vector<const views::View*> GetDraggingViews() const;
++
++  // Helium anchored tabs hooks. Called on each drag update with the current
++  // dragged-tab bounds and target layout so a derived container can decide
++  // whether the drag is above or below the anchored separator, and called when
++  // the drag ends (before drag state is cleared) to apply that decision.
++  // Default no-ops.
++  virtual void UpdateDragAnchorState(const gfx::Rect& dragged_tab_bounds,
++                                     const views::ProposedLayout& layout) {}
++  virtual void FinalizeDragAnchorState(bool completed) {}
++
+  private:
+   // Returns the scroll view for the container.
+   virtual views::ScrollView* GetScrollViewForContainer() const = 0;
+@@ -194,8 +205,6 @@
+   // tabs' position changes.
+   void ApplyUpdatesForDragPositionChange();
+ 
+-  std::vector<const views::View*> GetDraggingViews() const;
+-
+   // Finds the node that the tab drag occurs *before*.
+   // A null value indicates that the drag is not before any node (i.e., at
+   // the end of the this container).
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_tab_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_tab_view.cc
+@@ -8,6 +8,7 @@
+ #include <string>
+ 
+ #include "base/command_line.h"
++#include "base/functional/bind.h"
+ #include "base/functional/callback_helpers.h"
+ #include "base/metrics/histogram_functions.h"
+ #include "base/metrics/user_metrics.h"
+@@ -25,6 +26,7 @@
+ #include "chrome/browser/ui/helium/anchored_tab_hibernation.h"
+ #include "chrome/browser/ui/layout_constants.h"
+ #include "chrome/browser/ui/tab_contents/core_tab_helper.h"
++#include "chrome/browser/ui/tab_ui_helper.h"
+ #include "chrome/browser/ui/tabs/alert/tab_alert_controller.h"
+ #include "chrome/browser/ui/tabs/tab_data.h"
+ #include "chrome/browser/ui/tabs/tab_muted_utils.h"
+@@ -37,6 +39,7 @@
+ #include "chrome/browser/ui/views/frame/browser_view.h"
+ #include "chrome/browser/ui/views/frame/themed_background.h"
+ #include "chrome/browser/ui/views/frame/vertical_tab_strip_region_view.h"
++#include "chrome/browser/ui/views/helium/tab_rename_dialog.h"
+ #include "chrome/browser/ui/views/tabs/tab/alert_indicator_button.h"
+ #include "chrome/browser/ui/views/tabs/tab/glow_hover_controller.h"
+ #include "chrome/browser/ui/views/tabs/tab/tab_accessibility.h"
+@@ -53,9 +56,14 @@
+ #include "chrome/common/buildflags.h"
+ #include "chrome/grit/generated_resources.h"
+ #include "chrome/grit/theme_resources.h"
++#include "chrome/common/webui_url_constants.h"
+ #include "components/contextual_tasks/public/features.h"
+ #include "components/tabs/public/tab_alert.h"
+ #include "components/tabs/public/tab_interface.h"
++#include "content/public/browser/navigation_controller.h"
++#include "content/public/browser/web_contents.h"
++#include "content/public/common/referrer.h"
++#include "content/public/common/url_constants.h"
+ #include "third_party/skia/include/core/SkPathBuilder.h"
+ #include "third_party/skia/include/core/SkRRect.h"
+ #include "ui/accessibility/ax_enums.mojom-shared.h"
+@@ -78,6 +86,7 @@
+ #include "ui/views/controls/focus_ring.h"
+ #include "ui/views/controls/highlight_path_generator.h"
+ #include "ui/views/controls/label.h"
++#include "ui/views/controls/textfield/textfield.h"
+ #include "ui/views/layout/delegating_layout_manager.h"
+ #include "ui/views/layout/layout_types.h"
+ #include "ui/views/layout/proposed_layout.h"
+@@ -143,6 +152,40 @@
+ BEGIN_METADATA(AnchoredGroupIndicatorView)
+ END_METADATA
+ 
++// A text field used for inline tab rename that commits when it loses focus.
++class InlineRenameTextfield : public views::Textfield {
++  METADATA_HEADER(InlineRenameTextfield, views::Textfield)
++
++ public:
++  explicit InlineRenameTextfield(base::RepeatingClosure on_blur)
++      : on_blur_(std::move(on_blur)) {}
++
++  void OnBlur() override {
++    views::Textfield::OnBlur();
++    on_blur_.Run();
++  }
++
++ private:
++  base::RepeatingClosure on_blur_;
++};
++
++BEGIN_METADATA(InlineRenameTextfield)
++END_METADATA
++
++// An "empty" new tab has no meaningful committed content yet (blank/NTP). Such
++// a tab is never treated as anchored, so closing it just removes it.
++bool IsBlankOrNewTabUrl(const GURL& url) {
++  if (!url.is_valid() || url.spec().empty() || url.IsAboutBlank()) {
++    return true;
++  }
++  if (url.SchemeIs(content::kChromeUIScheme)) {
++    const std::string_view host = url.host();
++    return host == chrome::kChromeUINewTabHost ||
++           host == chrome::kChromeUINewTabPageHost;
++  }
++  return false;
++}
++
+ bool IsSelectionModifierDown(const ui::MouseEvent& event) {
+ #if BUILDFLAG(IS_MAC)
+   return event.IsCommandDown();
+@@ -258,6 +301,14 @@
+       collection_node_->RegisterDataChangedCallback(base::BindRepeating(
+           &VerticalTabView::OnDataChanged, base::Unretained(this)));
+ 
++  // Refresh on TabUIHelper changes (fired on navigation) so the return-to-anchor
++  // indicator updates immediately instead of going stale until reselect.
++  if (TabUIHelper* const helper = TabUIHelper::From(tab)) {
++    tab_ui_change_subscription_ = helper->AddTabUIChangeCallback(
++        base::BindRepeating(&VerticalTabView::OnTabUiHelperChanged,
++                            base::Unretained(this)));
++  }
++
+   CHECK(collection_node_->GetController());
+   auto* state_controller =
+       collection_node_->GetController()->GetStateController();
+@@ -267,6 +318,15 @@
+       state_controller->RegisterOnCollapseChanged(base::BindRepeating(
+           &VerticalTabView::OnCollapseStateChanged, base::Unretained(this)));
+ 
++  // Inline rename editor, overlaid on the title while renaming. Hidden until a
++  // double-click on an anchor-eligible tab activates it.
++  rename_textfield_ = AddChildView(std::make_unique<InlineRenameTextfield>(
++      base::BindRepeating(&VerticalTabView::CommitInlineRename,
++                          weak_ptr_factory_.GetWeakPtr())));
++  rename_textfield_->SetController(this);
++  rename_textfield_->SetVisible(false);
++  rename_textfield_->SetBorder(views::CreateEmptyBorder(gfx::Insets()));
++
+   set_context_menu_controller(this);
+ }
+ 
+@@ -396,6 +456,12 @@
+ bool VerticalTabView::OnMousePressed(const ui::MouseEvent& event) {
+   CHECK(collection_node_);
+ 
++  // Double-clicking an anchored tab opens its rename editor.
++  if (event.IsOnlyLeftMouseButton() && event.GetClickCount() == 2 &&
++      MaybeStartInlineRename()) {
++    return true;
++  }
++
+   auto* controller = collection_node_->GetController();
+   shift_pressed_on_mouse_down_ = event.IsShiftDown();
+   RecordMousePressedInTab();
+@@ -435,7 +501,7 @@
+   auto* controller = collection_node_->GetController();
+   base::WeakPtr<VerticalTabView> self = weak_ptr_factory_.GetWeakPtr();
+   if (event.IsOnlyMiddleMouseButton()) {
+-    if (HitTestPoint(event.location())) {
++    if (HitTestPoint(event.location()) && !MaybeReturnToAnchorInsteadOfClose()) {
+       controller->CloseTab(GetTabInterface());
+     }
+   } else if (event.IsOnlyLeftMouseButton() &&
+@@ -781,10 +847,7 @@
+   }
+ 
+   if (child_view == anchored_group_indicator_) {
+-    const tabs::TabInterface* tab_interface = GetTabInterface();
+-    return features::IsHeliumAnchoredTabsEnabled() && !collapsed_ &&
+-           !tab_data_.is_tab_discarded && tab_interface &&
+-           tab_interface->GetGroup().has_value();
++    return ShouldShowAnchorReturnIndicator();
+   }
+ 
+   if (child_view == close_button_) {
+@@ -830,6 +893,7 @@
+   const bool is_centered = (pinned_ || collapsed_) && !IsInExpandOnHover(width);
+ 
+   int placed_children = 0;
++  bool rename_emitted = false;
+   for (const auto& child : tab_children_configs_) {
+     const bool can_render_child =
+         is_centered
+@@ -838,9 +902,18 @@
+                placed_children < 2);
+     const bool is_child_visible = IsChildVisible(child.view, width);
+     if (is_child_visible && can_render_child) {
++      const gfx::Rect child_bounds =
++          GetChildBounds(bounds_remaining, child, is_centered);
++      // While renaming, the inline text field takes over the title's slot.
++      const bool show_rename =
++          child.view == title_ && rename_active_ && rename_textfield_;
+       layouts.child_layouts.emplace_back(
+-          child.view.get(), is_child_visible,
+-          GetChildBounds(bounds_remaining, child, is_centered));
++          child.view.get(), is_child_visible && !show_rename, child_bounds);
++      if (show_rename) {
++        layouts.child_layouts.emplace_back(rename_textfield_.get(), true,
++                                           child_bounds);
++        rename_emitted = true;
++      }
+ 
+       if (!is_centered) {
+         bounds_remaining.Inset(
+@@ -861,6 +934,13 @@
+     }
+   }
+ 
++  // Keep the inline rename field explicitly hidden when not renaming so the
++  // layout manager doesn't leave it stranded with stale bounds/visibility.
++  if (rename_textfield_ && !rename_emitted) {
++    layouts.child_layouts.emplace_back(rename_textfield_.get(), false,
++                                       gfx::Rect());
++  }
++
+   return layouts;
+ }
+ 
+@@ -914,6 +994,10 @@
+     views::View* source,
+     const gfx::Point& point,
+     ui::mojom::MenuSourceType source_type) {
++  // Don't pop a context menu while the inline rename field is active.
++  if (rename_active_) {
++    return;
++  }
+   if (collection_node_) {
+     if (auto* controller = collection_node_->GetController()) {
+       controller->ShowContextMenuForNode(collection_node_, source, point,
+@@ -1011,6 +1095,10 @@
+   split_ = tab->IsSplit();
+   pinned_ = tab->IsPinned();
+ 
++  // Capture the anchor URL baseline for anchor-eligible tabs (including grouped
++  // ones) so the return-to-anchor indicator and close behavior have a baseline.
++  MaybeCaptureAnchorUrl(tab, index);
++
+   SetSelection(tab->IsSelected());
+   UpdateTabData(tab);
+ 
+@@ -1149,6 +1237,14 @@
+ void VerticalTabView::CloseButtonPressed(const ui::Event& event) {
+   CHECK(collection_node_);
+ 
++  // For anchor-eligible tabs that have navigated away from their anchor URL,
++  // the close button first returns them to the anchor instead of closing.
++  // Non-anchored standalone tabs (e.g. brand-new tabs) are never eligible and
++  // close normally.
++  if (MaybeReturnToAnchorInsteadOfClose()) {
++    return;
++  }
++
+   if (active_) {
+     base::RecordAction(base::UserMetricsAction("CloseTab_Active"));
+   } else {
+@@ -1256,6 +1352,195 @@
+   return std::get<const tabs::TabInterface*>(collection_node_->GetNodeData());
+ }
+ 
++bool VerticalTabView::MaybeStartInlineRename() {
++  if (!collection_node_) {
++    return false;
++  }
++  auto* controller = collection_node_->GetController();
++  if (!controller) {
++    return false;
++  }
++  TabStripModel* const model = controller->GetModel();
++  tabs::TabInterface* const tab =
++      const_cast<tabs::TabInterface*>(GetTabInterface());
++  if (!model || !tab) {
++    return false;
++  }
++  const int index = model->GetIndexOfTab(tab);
++  if (index < 0 || !helium::IsAnchorEligibleForUiFeatures(model, index)) {
++    return false;
++  }
++
++  BeginInlineRename();
++  return true;
++}
++
++void VerticalTabView::BeginInlineRename() {
++  if (rename_active_ || !rename_textfield_) {
++    return;
++  }
++  tabs::TabInterface* const tab =
++      const_cast<tabs::TabInterface*>(GetTabInterface());
++  TabUIHelper* const helper = tab ? TabUIHelper::From(tab) : nullptr;
++  if (!helper) {
++    return;
++  }
++
++  rename_active_ = true;
++  rename_textfield_->SetText(helper->GetTitle());
++  rename_textfield_->SetVisible(true);
++  InvalidateLayout();
++  rename_textfield_->RequestFocus();
++  rename_textfield_->SelectAll(/*reversed=*/false);
++}
++
++void VerticalTabView::CommitInlineRename() {
++  if (!rename_active_ || finishing_rename_) {
++    return;
++  }
++  finishing_rename_ = true;
++
++  std::u16string new_title(rename_textfield_ ? rename_textfield_->GetText()
++                                             : std::u16string_view());
++  if (tabs::TabInterface* const tab =
++          const_cast<tabs::TabInterface*>(GetTabInterface())) {
++    if (TabUIHelper* const helper = TabUIHelper::From(tab)) {
++      // Persisted via the session extra-data path so the custom name survives
++      // browser restarts.
++      helper->SetCustomTitle(std::move(new_title));
++    }
++  }
++
++  rename_active_ = false;
++  if (rename_textfield_) {
++    rename_textfield_->SetVisible(false);
++  }
++  finishing_rename_ = false;
++  InvalidateLayout();
++}
++
++void VerticalTabView::CancelInlineRename() {
++  if (!rename_active_ || finishing_rename_) {
++    return;
++  }
++  finishing_rename_ = true;
++  rename_active_ = false;
++  if (rename_textfield_) {
++    rename_textfield_->SetVisible(false);
++  }
++  finishing_rename_ = false;
++  InvalidateLayout();
++}
++
++bool VerticalTabView::HandleKeyEvent(views::Textfield* sender,
++                                     const ui::KeyEvent& key_event) {
++  if (sender != rename_textfield_ ||
++      key_event.type() != ui::EventType::kKeyPressed) {
++    return false;
++  }
++  if (key_event.key_code() == ui::VKEY_RETURN) {
++    CommitInlineRename();
++    return true;
++  }
++  if (key_event.key_code() == ui::VKEY_ESCAPE) {
++    CancelInlineRename();
++    return true;
++  }
++  return false;
++}
++
++bool VerticalTabView::MaybeReturnToAnchorInsteadOfClose() {
++  if (!features::IsHeliumAnchoredTabsEnabled() || !collection_node_) {
++    return false;
++  }
++  auto* controller = collection_node_->GetController();
++  if (!controller) {
++    return false;
++  }
++  TabStripModel* const model = controller->GetModel();
++  tabs::TabInterface* const tab =
++      const_cast<tabs::TabInterface*>(GetTabInterface());
++  if (!model || !tab) {
++    return false;
++  }
++  const int index = model->GetIndexOfTab(tab);
++  if (index < 0 || !helium::IsAnchorEligibleForUiFeatures(model, index)) {
++    return false;
++  }
++  TabUIHelper* const helper = TabUIHelper::From(tab);
++  // Only return to a real, navigable anchor. A blank/NTP anchor (which may have
++  // been persisted by an older build) must never hijack the close: an empty new
++  // tab should just close.
++  if (!helper || !helper->anchored_url().is_valid() ||
++      IsBlankOrNewTabUrl(helper->anchored_url())) {
++    return false;
++  }
++  content::WebContents* const contents = tab->GetContents();
++  if (!contents) {
++    return false;
++  }
++  // Already at the anchor: let the close proceed normally.
++  if (contents->GetLastCommittedURL() == helper->anchored_url()) {
++    return false;
++  }
++  contents->GetController().LoadURL(helper->anchored_url(), content::Referrer(),
++                                    ui::PAGE_TRANSITION_AUTO_BOOKMARK,
++                                    std::string());
++  return true;
++}
++
++void VerticalTabView::MaybeCaptureAnchorUrl(tabs::TabInterface* tab,
++                                            int model_index) {
++  if (!features::IsHeliumAnchoredTabsEnabled() || !tab || !collection_node_ ||
++      !collection_node_->GetController()) {
++    return;
++  }
++  TabStripModel* const model = collection_node_->GetController()->GetModel();
++  if (!model || !helium::IsAnchorEligibleForUiFeatures(model, model_index)) {
++    return;
++  }
++  TabUIHelper* const helper = TabUIHelper::From(tab);
++  if (!helper || helper->anchored_url().is_valid()) {
++    return;
++  }
++  content::WebContents* const contents = tab->GetContents();
++  if (!contents) {
++    return;
++  }
++  const GURL url = contents->GetLastCommittedURL();
++  // Don't anchor an empty new tab (blank/NTP). It only becomes anchored once it
++  // has real content, so an empty grouped new tab still closes normally.
++  if (url.is_valid() && !IsBlankOrNewTabUrl(url)) {
++    helper->SetAnchoredURL(url, contents->GetTitle());
++  }
++}
++
++bool VerticalTabView::ShouldShowAnchorReturnIndicator() const {
++  if (!features::IsHeliumAnchoredTabsEnabled() || collapsed_ ||
++      tab_data_.is_tab_discarded) {
++    return false;
++  }
++  const tabs::TabInterface* const tab_interface = GetTabInterface();
++  if (!tab_interface) {
++    return false;
++  }
++  const TabUIHelper* const helper = TabUIHelper::From(tab_interface);
++  if (!helper || !helper->anchored_url().is_valid() ||
++      IsBlankOrNewTabUrl(helper->anchored_url())) {
++    return false;
++  }
++  // Show the "return to anchor" affordance only once the tab has navigated
++  // away from its original anchored URL.
++  return tab_data_.last_committed_url.is_valid() &&
++         tab_data_.last_committed_url != helper->anchored_url();
++}
++
++void VerticalTabView::OnTabUiHelperChanged() {
++  if (collection_node_) {
++    OnDataChanged();
++  }
++}
++
+ void VerticalTabView::UpdateHoverCard(HoverCardAnchorTarget* target,
+                                       int hover_card_update_type) {
+   CHECK(collection_node_);
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_tab_view.h
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_tab_view.h
+@@ -23,6 +23,7 @@
+ #include "ui/base/metadata/metadata_header_macros.h"
+ #include "ui/gfx/canvas.h"
+ #include "ui/views/context_menu_controller.h"
++#include "ui/views/controls/textfield/textfield_controller.h"
+ #include "ui/views/layout/delegating_layout_manager.h"
+ #include "ui/views/layout/flex_layout.h"
+ #include "ui/views/masked_targeter_delegate.h"
+@@ -34,6 +35,10 @@
+ class TabIcon;
+ class TabTitle;
+ 
++namespace views {
++class Textfield;
++}  // namespace views
++
+ namespace glic {
+ class TabUnderlineView;
+ }
+@@ -48,6 +53,7 @@
+                         public views::MaskedTargeterDelegate,
+                         public AlertIndicatorButton::Delegate,
+                         public views::ContextMenuController,
++                        public views::TextfieldController,
+                         public HoverCardAnchorTarget {
+   METADATA_HEADER(VerticalTabView, views::View)
+ 
+@@ -74,6 +80,7 @@
+   float radial_highlight_opacity() { return radial_highlight_opacity_; }
+   const tabs::TabData& data() const { return tab_data_; }
+   bool IsActive() const { return active_; }
++  const tabs::TabInterface* GetTabInterface() const;
+ 
+   TabCloseButton* close_button_for_testing() { return close_button_; }
+ 
+@@ -176,6 +183,31 @@
+   void CloseButtonPressed(const ui::Event& event);
+   void RecordMousePressedInTab();
+ 
++  // Opens the inline rename editor for this tab if it is anchor-eligible.
++  // Returns true if the editor was opened. Triggered by a double-click.
++  bool MaybeStartInlineRename();
++  // Inline rename lifecycle: replaces the title with an editable text field.
++  void BeginInlineRename();
++  void CommitInlineRename();
++  void CancelInlineRename();
++  bool IsRenaming() const { return rename_active_; }
++
++  // views::TextfieldController:
++  bool HandleKeyEvent(views::Textfield* sender,
++                      const ui::KeyEvent& key_event) override;
++
++  // If this tab is anchor-eligible and has navigated away from its anchor URL,
++  // navigates back to the anchor URL instead of closing and returns true.
++  bool MaybeReturnToAnchorInsteadOfClose();
++  // Captures the current committed URL as the anchor baseline the first time we
++  // see an anchor-eligible tab with a valid URL (covers grouped tabs).
++  void MaybeCaptureAnchorUrl(tabs::TabInterface* tab, int model_index);
++  // Whether the "return to anchor" indicator should currently be shown.
++  bool ShouldShowAnchorReturnIndicator() const;
++  // Refresh handler wired to TabUIHelper change notifications (fires on
++  // navigation), so the return-to-anchor indicator updates without a reselect.
++  void OnTabUiHelperChanged();
++
+   void UpdateHoverCard(HoverCardAnchorTarget* target,
+                        int hover_card_update_type);
+ 
+@@ -192,8 +224,6 @@
+ 
+   bool IsInExpandOnHover(int width) const;
+ 
+-  const tabs::TabInterface* GetTabInterface() const;
+-
+   raw_ptr<TabCollectionNode> collection_node_ = nullptr;
+ 
+   std::vector<TabChildConfig> tab_children_configs_;
+@@ -203,6 +233,8 @@
+   const raw_ptr<TabIcon> icon_;
+   const raw_ptr<views::View> anchored_group_indicator_;
+   const raw_ptr<TabTitle> title_;
++  // Inline rename editor, overlaid on the title region while renaming.
++  raw_ptr<views::Textfield> rename_textfield_ = nullptr;
+   const raw_ptr<AlertIndicatorButton> alert_indicator_;
+   const raw_ptr<TabCloseButton> close_button_;
+   raw_ptr<glic::TabUnderlineView> glic_tab_underline_view_ = nullptr;
+@@ -221,6 +253,12 @@
+   bool collapsed_ = false;
+   bool pinned_ = false;
+   bool shift_pressed_on_mouse_down_ = false;
++  // True while the inline rename text field is active.
++  bool rename_active_ = false;
++  // Guards re-entrancy between commit/cancel and the text field's blur.
++  bool finishing_rename_ = false;
++
++  base::CallbackListSubscription tab_ui_change_subscription_;
+ 
+   std::unique_ptr<GlowHoverController> hover_controller_;
+   float hover_opacity_min_;
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_unpinned_tab_container_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_unpinned_tab_container_view.cc
+@@ -4,12 +4,16 @@
+ 
+ #include "chrome/browser/ui/views/tabs/vertical/vertical_unpinned_tab_container_view.h"
+ 
++#include <optional>
++
+ #include "base/containers/adapters.h"
+ #include "base/functional/bind.h"
+ #include "base/time/time.h"
+ #include "chrome/browser/ui/layout_constants.h"
+ #include "chrome/browser/ui/tabs/tab_enums.h"
+ #include "chrome/browser/ui/tabs/tab_group_model.h"
++#include "chrome/browser/ui/helium/anchored_tab_hibernation.h"
++#include "chrome/browser/ui/tab_ui_helper.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+ #include "chrome/browser/ui/ui_features.h"
+ #include "chrome/browser/ui/views/tabs/vertical/tab_collection_animating_layout_manager.h"
+@@ -154,22 +158,37 @@
+ 
+ VerticalUnpinnedTabContainerView::~VerticalUnpinnedTabContainerView() = default;
+ 
+-VerticalUnpinnedTabContainerView::ChildPartitions
+-VerticalUnpinnedTabContainerView::PartitionChildren(
+-    const std::vector<views::View*>& children) const {
+-  ChildPartitions partitions;
+-  partitions.grouped.reserve(children.size());
+-  partitions.ungrouped.reserve(children.size());
+-  if (features::IsHeliumAnchoredTabsEnabled()) {
+-    for (views::View* child : children) {
+-      if (views::AsViewClass<VerticalTabGroupView>(child)) {
+-        partitions.grouped.push_back(child);
+-      } else {
+-        partitions.ungrouped.push_back(child);
+-      }
+-    }
++bool VerticalUnpinnedTabContainerView::BelongsAboveSeparator(
++    const views::View* child) const {
++  if (!features::IsHeliumAnchoredTabsEnabled()) {
++    return false;
++  }
++  // Groups always live in the anchored region.
++  if (views::IsViewClass<VerticalTabGroupView>(child)) {
++    return true;
++  }
++  // During a drag, preview the anchored/unanchored decision live for the
++  // dragged tab so the rest of the strip reflows as it crosses the separator.
++  if (drag_anchor_active_ && views::IsViewClass<VerticalTabView>(child) &&
++      IsViewDragging(*child)) {
++    return drag_anchor_target_;
++  }
++  return IsAnchoredStandaloneTabView(child);
++}
++
++bool VerticalUnpinnedTabContainerView::IsAnchoredStandaloneTabView(
++    const views::View* child) const {
++  const auto* tab_view = views::AsViewClass<VerticalTabView>(child);
++  if (!tab_view) {
++    return false;
+   }
+-  return partitions;
++  const tabs::TabInterface* const tab = tab_view->GetTabInterface();
++  if (!tab) {
++    return false;
++  }
++  const TabUIHelper* const helper =
++      TabUIHelper::From(const_cast<tabs::TabInterface*>(tab));
++  return helper && helper->anchored();
+ }
+ 
+ void VerticalUnpinnedTabContainerView::AddChildLayout(
+@@ -312,16 +331,34 @@
+                        : std::vector<views::View*>();
+   const bool is_collapsed =
+       collapse_state != tabs::VerticalTabStripCollapseState::kExpanded;
+-  const ChildPartitions partitions = PartitionChildren(children);
+-  const std::vector<views::View*>& layout_children =
+-      features::IsHeliumAnchoredTabsEnabled() ? partitions.grouped : children;
++  // Split children into the anchored region (above the separator) and the
++  // regular region (below it), preserving natural (model) order so that
++  // standalone anchored tabs can freely interleave with groups.
++  const bool anchored_enabled = features::IsHeliumAnchoredTabsEnabled();
++  std::vector<views::View*> above;
++  std::vector<views::View*> below;
++  if (anchored_enabled) {
++    above.reserve(children.size());
++    below.reserve(children.size());
++    for (views::View* child : children) {
++      if (BelongsAboveSeparator(child)) {
++        above.push_back(child);
++      } else {
++        below.push_back(child);
++      }
++    }
++  } else {
++    // Legacy behavior: lay everything out in order with no separator.
++    above = children;
++  }
+ 
+-  for (auto* child : layout_children) {
++  for (auto* child : above) {
+     AddChildLayout(child, size_bounds, horizontal_padding, is_collapsed,
+                    &layouts, &state);
+   }
+ 
+-  if (features::IsHeliumAnchoredTabsEnabled() && !partitions.grouped.empty()) {
++  const bool has_anchored_region = anchored_enabled && !above.empty();
++  if (has_anchored_region) {
+     AddGroupedSeparatorLayout(size_bounds, horizontal_padding, is_collapsed,
+                               &layouts, &state);
+   } else {
+@@ -333,11 +370,9 @@
+ 
+   AddMiddlePinnedViewLayout(size_bounds, horizontal_padding, &layouts, &state);
+ 
+-  if (features::IsHeliumAnchoredTabsEnabled()) {
+-    for (auto* child : partitions.ungrouped) {
+-      AddChildLayout(child, size_bounds, horizontal_padding, is_collapsed,
+-                     &layouts, &state);
+-    }
++  for (auto* child : below) {
++    AddChildLayout(child, size_bounds, horizontal_padding, is_collapsed,
++                   &layouts, &state);
+   }
+   // Remove excess padding if needed.
+   if (!children.empty()) {
+@@ -511,7 +546,9 @@
+   }
+ 
+   for (int i = model->count() - 1; i >= 0; --i) {
+-    if (!model->IsTabPinned(i) && !model->GetTabGroupForTab(i).has_value()) {
++    // Anchored tabs (grouped, pinned, or explicitly anchored standalone tabs)
++    // live above the separator and must not be cleared.
++    if (!helium::IsAnchoredTab(model, i)) {
+       model->CloseWebContentsAt(i,
+                                 TabCloseTypes::CLOSE_USER_GESTURE |
+                                     TabCloseTypes::CLOSE_CREATE_HISTORICAL_TAB);
+@@ -555,6 +592,85 @@
+   return layout_manager_->target_layout();
+ }
+ 
++void VerticalUnpinnedTabContainerView::UpdateDragAnchorState(
++    const gfx::Rect& dragged_tab_bounds,
++    const views::ProposedLayout& layout) {
++  bool new_active = false;
++  bool new_target = drag_anchor_target_;
++
++  if (features::IsHeliumAnchoredTabsEnabled()) {
++    // The boundary between the anchored region and the regular tabs is the
++    // separator when it is shown, otherwise the "+ New Tab" row.
++    std::optional<int> boundary_y;
++    for (const auto& child_layout : layout.child_layouts) {
++      if (child_layout.child_view == grouped_tabs_separator_ &&
++          child_layout.visible) {
++        boundary_y = child_layout.bounds.y();
++        break;
++      }
++    }
++    if (!boundary_y.has_value()) {
++      for (const auto& child_layout : layout.child_layouts) {
++        if (child_layout.child_view == middle_pinned_view_ &&
++            child_layout.visible) {
++          boundary_y = child_layout.bounds.y();
++          break;
++        }
++      }
++    }
++    if (boundary_y.has_value()) {
++      new_active = true;
++      new_target = dragged_tab_bounds.CenterPoint().y() < boundary_y.value();
++    }
++  }
++
++  // Re-run layout when the above/below-separator decision changes so the rest
++  // of the strip reflows live to make room for the dragged tab.
++  if (new_active != drag_anchor_active_ || new_target != drag_anchor_target_) {
++    drag_anchor_active_ = new_active;
++    drag_anchor_target_ = new_target;
++    InvalidateLayout();
++  }
++}
++
++void VerticalUnpinnedTabContainerView::FinalizeDragAnchorState(bool completed) {
++  const bool was_active = drag_anchor_active_;
++  drag_anchor_active_ = false;
++  // Only apply the anchored decision for a completed drop; a canceled/reverted
++  // drag must leave the tab's anchored state untouched.
++  if (!completed || !was_active || !features::IsHeliumAnchoredTabsEnabled()) {
++    return;
++  }
++
++  bool changed = false;
++  for (const views::View* dragging_view : GetDraggingViews()) {
++    auto* tab_view = views::AsViewClass<VerticalTabView>(
++        const_cast<views::View*>(dragging_view));
++    if (!tab_view) {
++      continue;
++    }
++    tabs::TabInterface* const tab =
++        const_cast<tabs::TabInterface*>(tab_view->GetTabInterface());
++    if (!tab) {
++      continue;
++    }
++    // Group membership already anchors a tab; only toggle the explicit flag for
++    // standalone tabs to avoid stale state on grouped tabs.
++    if (tab->GetGroup().has_value()) {
++      continue;
++    }
++    TabUIHelper* const helper = TabUIHelper::From(tab);
++    if (!helper || helper->anchored() == drag_anchor_target_) {
++      continue;
++    }
++    helper->SetAnchored(drag_anchor_target_);
++    changed = true;
++  }
++  if (changed) {
++    InvalidateLayout();
++  }
++}
++
+ VerticalDraggedTabsContainer&
+ VerticalUnpinnedTabContainerView::GetTabDragTarget(
+     const gfx::Point& point_in_screen) {
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_unpinned_tab_container_view.h
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_unpinned_tab_container_view.h
+@@ -23,6 +23,7 @@
+ namespace views {
+ class LabelButton;
+ class Separator;
++struct ProposedLayout;
+ }  // namespace views
+ 
+ namespace ui {
+@@ -83,6 +84,9 @@
+   const views::ProposedLayout& GetLayoutForDrag() const override;
+   const TabCollectionNode* GetCollectionNodeFromView(
+       const views::View& view) const override;
++  void UpdateDragAnchorState(const gfx::Rect& dragged_tab_bounds,
++                             const views::ProposedLayout& layout) override;
++  void FinalizeDragAnchorState(bool completed) override;
+ 
+   // Returns whether a drag that is currently being handled by the given
+   // `group_view` should continue being handled by it.
+@@ -93,18 +97,21 @@
+   void ResetCollectionNode();
+   void CloseUngroupedTabs();
+ 
+-  struct ChildPartitions {
+-    std::vector<views::View*> grouped;
+-    std::vector<views::View*> ungrouped;
+-  };
++  // Whether `child` is a standalone tab view that is explicitly anchored.
++  bool IsAnchoredStandaloneTabView(const views::View* child) const;
++
++  // Whether `child` should be laid out in the anchored region, above the
++  // separator. True for groups and explicitly-anchored standalone tabs, in
++  // natural (model) order so standalone anchors can interleave with groups.
++  // During a drag this reflects the live above/below-separator decision for the
++  // dragged tab so the rest of the strip reflows as it crosses the separator.
++  bool BelongsAboveSeparator(const views::View* child) const;
+ 
+   struct LayoutState {
+     int width = 0;
+     int height = 0;
+   };
+ 
+-  ChildPartitions PartitionChildren(
+-      const std::vector<views::View*>& children) const;
+   void AddChildLayout(views::View* child,
+                       const views::SizeBounds& size_bounds,
+                       int horizontal_padding,
+@@ -126,6 +133,10 @@
+   raw_ptr<views::LabelButton> clear_ungrouped_tabs_button_ = nullptr;
+   bool clear_ungrouped_tabs_hovered_ = false;
+   raw_ptr<views::View> middle_pinned_view_ = nullptr;
++  // Tracks, during a drag, whether the dragged tab(s) should become anchored
++  // (dropped above the separator) or unanchored (dropped below it).
++  bool drag_anchor_active_ = false;
++  bool drag_anchor_target_ = false;
+   const raw_ref<TabCollectionAnimatingLayoutManager> layout_manager_;
+ 
+   base::CallbackListSubscription node_destroyed_subscription_;

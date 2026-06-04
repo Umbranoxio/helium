@@ -1,0 +1,248 @@
+Anchored tabs: most-recently-active visibility in collapsed groups, a fix
+for closing the active tab, and forcing new tabs to the bottom section.
+
+- When a tab group is collapsed, keep visible the tabs that are among the
+  browser-wide 5 most-recently-active tabs (by last-active time) instead of only
+  the active tab; tabs outside that set are hidden and hibernated off the
+  current call stack. Adds helium::GetTopRecentlyActiveContents and
+  helium::HibernateGroupTabsOutsideTopRecent.
+- Removes the anchored-tabs fallback that force-added a replacement tab from
+  inside TabStripModel::CloseTabs when the active tab was closed with no live
+  fallback. That ran inside the close reentrancy guard (crashing on AddTab) and
+  caused new tabs to "reopen instead of close". Closing now follows the standard
+  path and activates the adjacent tab.
+- Forces a brand-new tab (Cmd/Ctrl+T, the new-tab button, omnibox Alt+Enter) to
+  open ungrouped at the bottom of the strip (the lower, non-anchored section) so
+  it is never absorbed into the active tab's group.
+
+--- a/chrome/browser/ui/tabs/tab_strip_model.cc
++++ b/chrome/browser/ui/tabs/tab_strip_model.cc
+@@ -283,11 +283,6 @@
+   return page_node;
+ }
+ 
+-bool ContainsWebContents(base::span<content::WebContents* const> items,
+-                         content::WebContents* contents) {
+-  return std::ranges::find(items, contents) != items.end();
+-}
+-
+ }  // namespace
+ 
+ TabGroupModelFactory::TabGroupModelFactory() {
+@@ -1897,19 +1892,36 @@
+     // For all other types, respect what was passed to us, normalizing -1s and
+     // values that are too large.
+     if (index < 0 || index > count()) {
+-      const bool new_tab_next_to_active =
+-          profile_->GetPrefs()->GetBoolean(prefs::kNewTabNextToActive);
+-      const auto opener_group = GetTabGroupForTab(active_index());
+-
+-      if (count() >= 1 && new_tab_next_to_active) {
+-        if (group_model_ && opener_group && !(add_types & ADD_ACTIVE)) {
+-          index = static_cast<int>(
+-              group_model_->GetTabGroup(*opener_group)->ListTabs().end());
++      // Helium: a brand-new tab (Cmd/Ctrl+T, the new-tab button, or omnibox
++      // Alt+Enter) must always open ungrouped at the very bottom of the strip,
++      // i.e. in the lower (non-anchored) section — it must never be absorbed
++      // into the active tab's group. Forcing the index to count() places it
++      // after every group so the contiguity logic below leaves it ungrouped.
++      // Restored/explicitly-placed tabs use ADD_FORCE_INDEX or carry an
++      // explicit group, so they are excluded here.
++      const bool helium_new_tab_to_bottom =
++          features::IsHeliumAnchoredTabsEnabled() && !group.has_value() &&
++          (add_types & ADD_FORCE_INDEX) == 0 &&
++          ui::PageTransitionTypeIncludingQualifiersIs(
++              transition, ui::PAGE_TRANSITION_TYPED);
++
++      if (helium_new_tab_to_bottom) {
++        index = count();
++      } else {
++        const bool new_tab_next_to_active =
++            profile_->GetPrefs()->GetBoolean(prefs::kNewTabNextToActive);
++        const auto opener_group = GetTabGroupForTab(active_index());
++
++        if (count() >= 1 && new_tab_next_to_active) {
++          if (group_model_ && opener_group && !(add_types & ADD_ACTIVE)) {
++            index = static_cast<int>(
++                group_model_->GetTabGroup(*opener_group)->ListTabs().end());
++          } else {
++            index = active_index() + 1;
++          }
+         } else {
+-          index = active_index() + 1;
++          index = count();
+         }
+-      } else {
+-        index = count();
+       }
+     }
+   }
+@@ -3941,21 +3953,12 @@
+     return;
+   }
+ 
+-  if (features::IsHeliumAnchoredTabsEnabled() && !closing_all_ &&
+-      ContainsWebContents(filtered_items, GetActiveWebContents())) {
+-    bool has_live_fallback = false;
+-    for (int i = 0; i < count(); ++i) {
+-      content::WebContents* const contents = GetWebContentsAt(i);
+-      if (!ContainsWebContents(filtered_items, contents) &&
+-          !contents->WasDiscarded()) {
+-        has_live_fallback = true;
+-        break;
+-      }
+-    }
+-    if (!has_live_fallback) {
+-      delegate()->AddTabAt(GURL(), -1, true);
+-    }
+-  }
++  // NOTE: Previously, when the anchored-tabs feature was on and the active tab
++  // was being closed with no remaining live (non-discarded) tab, a replacement
++  // tab was force-added here. That both crashed (re-entering AddTab inside the
++  // close reentrancy guard) and produced surprising "the tab reopened instead
++  // of closing" behavior. It is removed: closing now follows the standard path
++  // and simply activates the adjacent tab (reloading it if discarded).
+ 
+   const bool closing_all = static_cast<int>(filtered_items.size()) == count();
+   base::WeakPtr<TabStripModel> ref = weak_factory_.GetWeakPtr();
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_tab_group_view.h
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_tab_group_view.h
+@@ -7,6 +7,7 @@
+ 
+ #include "base/callback_list.h"
+ #include "base/memory/raw_ptr.h"
++#include "base/memory/weak_ptr.h"
+ #include "chrome/browser/ui/tabs/tab_group_attention_indicator.h"
+ #include "chrome/browser/ui/views/frame/browser_root_view.h"
+ #include "chrome/browser/ui/views/tabs/tab_strip_types.h"
+@@ -108,8 +109,16 @@
+   void ResetCollectionNode();
+   void OnDataChanged();
+   void UpdateChildVisibilityForCollapseState(bool collapsed);
++  // Schedules (off the current call stack) hibernation of this group's loaded
++  // tabs that are not among the browser-wide most-recently-active tabs.
++  void ScheduleHibernateTabsOutsideTopRecent();
++  void HibernateTabsOutsideTopRecent();
+   bool GetIsShared();
+ 
++  // Number of most-recently-active tabs (browser-wide) kept visible inside a
++  // collapsed group; tabs outside this set are hidden and hibernated.
++  static constexpr size_t kMaxRecentVisibleTabs = 5;
++
+   raw_ptr<TabCollectionNode> collection_node_ = nullptr;
+ 
+   base::CallbackListSubscription node_destroyed_subscription_;
+@@ -124,6 +133,11 @@
+   base::ScopedObservation<TabGroupAttentionIndicator,
+                           TabGroupAttentionIndicator::Observer>
+       attention_indicator_observation_{this};
++
++  // Guards against scheduling redundant hibernation passes.
++  bool hibernate_scheduled_ = false;
++
++  base::WeakPtrFactory<VerticalTabGroupView> weak_ptr_factory_{this};
+ };
+ 
+ #endif  // CHROME_BROWSER_UI_VIEWS_TABS_VERTICAL_VERTICAL_TAB_GROUP_VIEW_H_
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_tab_group_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_tab_group_view.cc
+@@ -6,9 +6,14 @@
+ 
+ #include <numeric>
+ 
++#include "base/containers/flat_set.h"
++#include "base/functional/bind.h"
++#include "base/location.h"
++#include "base/task/single_thread_task_runner.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_features.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+ #include "chrome/browser/ui/helium/anchored_tab_hibernation.h"
++#include "chrome/browser/ui/tabs/tab_strip_model.h"
+ #include "chrome/browser/ui/layout_constants.h"
+ #include "chrome/browser/ui/tabs/tab_group_features.h"
+ #include "chrome/browser/ui/tabs/tab_group_theme.h"
+@@ -34,6 +39,8 @@
+ #include "components/tabs/public/tab_collection_storage.h"
+ #include "components/tabs/public/tab_group.h"
+ #include "components/tabs/public/tab_group_tab_collection.h"
++#include "components/tabs/public/tab_interface.h"
++#include "content/public/browser/web_contents.h"
+ #include "ui/base/l10n/l10n_util.h"
+ #include "ui/base/metadata/metadata_impl_macros.h"
+ #include "ui/base/models/list_selection_model.h"
+@@ -427,17 +434,74 @@
+       !collapsed && !(features::IsHeliumAnchoredTabsEnabled() &&
+                       GetTabStripCollapseState() !=
+                           tabs::VerticalTabStripCollapseState::kExpanded));
++
++  // When collapsed with the anchored-tabs feature on, keep visible the tabs that
++  // are among the browser-wide most-recently-active set (instead of only the
++  // active tab). Tabs outside that set are hidden and later hibernated.
++  const bool use_recent_visible =
++      collapsed && features::IsHeliumAnchoredTabsEnabled() &&
++      collection_node_->GetController();
++  base::flat_set<const content::WebContents*> top_recent;
++  if (use_recent_visible) {
++    if (TabStripModel* const model =
++            collection_node_->GetController()->GetModel()) {
++      top_recent =
++          helium::GetTopRecentlyActiveContents(model, kMaxRecentVisibleTabs);
++    }
++  }
++
+   for (auto* child : collection_node_->GetDirectChildren()) {
+     bool visible = !collapsed;
+     if (collapsed) {
+       if (auto* tab_view = views::AsViewClass<VerticalTabView>(child)) {
+-        visible = tab_view->IsActive() && !tab_view->data().is_tab_discarded;
++        if (use_recent_visible) {
++          content::WebContents* const web_contents =
++              tab_view->GetTabInterface()
++                  ? const_cast<tabs::TabInterface*>(
++                        tab_view->GetTabInterface())
++                        ->GetContents()
++                  : nullptr;
++          visible = web_contents && !web_contents->WasDiscarded() &&
++                    top_recent.contains(web_contents);
++        } else {
++          visible = tab_view->IsActive() && !tab_view->data().is_tab_discarded;
++        }
+       } else {
+         visible = false;
+       }
+     }
+     child->SetVisible(visible);
+   }
++
++  if (use_recent_visible) {
++    ScheduleHibernateTabsOutsideTopRecent();
++  }
++}
++
++void VerticalTabGroupView::ScheduleHibernateTabsOutsideTopRecent() {
++  if (hibernate_scheduled_) {
++    return;
++  }
++  hibernate_scheduled_ = true;
++  base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
++      FROM_HERE,
++      base::BindOnce(&VerticalTabGroupView::HibernateTabsOutsideTopRecent,
++                     weak_ptr_factory_.GetWeakPtr()));
++}
++
++void VerticalTabGroupView::HibernateTabsOutsideTopRecent() {
++  hibernate_scheduled_ = false;
++  if (!collection_node_ || !IsCollapsed() ||
++      !collection_node_->GetController()) {
++    return;
++  }
++  TabStripModel* const model = collection_node_->GetController()->GetModel();
++  if (!model) {
++    return;
++  }
++  helium::HibernateGroupTabsOutsideTopRecent(
++      model, GetTabGroupFromNode(collection_node_)->id(),
++      kMaxRecentVisibleTabs);
+ }
+ 
+ bool VerticalTabGroupView::IsCollapsed() const {
